@@ -1,0 +1,7 @@
+old/
+useco1/
+wandb/
+region_to_states.pkl
+train_tiles.txt
+results/
+records/
