@@ -11,10 +11,11 @@ import sys
 sys.path.append("../")
 from prithvi_hf.prithvi import PrithviSeg
 from prithvi_hf.lsp_transformer_pixels import TemporalTransformer
-from prithvi_hf.lsp_unet import UNet3DTimeAware
-from prithvi_hf.lsp_transformer_spatial import TinyPrithviSeg
+from prithvi_hf.unet import UNet3D
+from prithvi_hf.prithvi_mini import TinyPrithviSeg
 from prithvi_hf.lsp_mlp_pixels import PixelTemporalMLP
-from prithvi_hf.lsp_transformer_pixels_feats import TemporalQFormer
+from prithvi_hf.lsp_transformer_patches import TemporalTransformerPerPatch
+from prithvi_hf.prithvi_lora import PrithviSegLora
 
 
 from utils import data_path_paper_all_12month_match, eval_data_loader, get_masks_paper
@@ -63,17 +64,18 @@ def main():
 
 
 		for group in tqdm(all_groups):
-
 			data_percentage = group.split("_")[-1] 
 
-			if "pixels" in group:
+			if ("pixels" in group) or ("patch" in group):
 				region_to_cut = " ".join(group.split("_")[4:-1]).upper()
 			else: 
 				region_to_cut = " ".join(group.split("region-")[1].split("_")[:-1]).upper()
 
+			batch_size = config["validation"]["batch_size"] if "patch" not in group else 4
+
 			path_val=data_path_paper_all_12month_match("validation", data_percentage, region_to_cut)
 			cycle_dataset_val=cycle_dataset(path_val,split="val", data_percentage=data_percentage, region_to_cut_name=region_to_cut)
-			val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
+			val_dataloader=DataLoader(cycle_dataset_val,batch_size=batch_size,shuffle=config["validation"]["shuffle"],num_workers=2)
 
 			best_param = None 
 			best_acc = 1000 
@@ -88,16 +90,23 @@ def main():
 				# Load the model
 				weights_path = None
 				if "unet" in group:
-					model = UNet3DTimeAware(
-						in_ch=6,
-						num_classes=4,
-						base_ch=32,   # try 32 or 48; 32 is pretty lightweight
-						depth=4,      # spatial pyramid /16; needs H,W divisible by 16
-						k_t=3,
-						norm='bn',
-						dropout=0.0,
-						time_pool='mean',  # 'conv' if you want a tiny learned temporal collapse
+					model = UNet3D(
+						in_channel=6,
+						n_classes=4,
+						timesteps=12,
+						dropout=0.1
 					)
+
+				elif "lora" in group:
+					r_param = int(params.split("_")[3].replace("r-", ""))
+					alpha_param = int(params.split("_")[4].replace("alpha-", "").replace(".pth", ""))
+					lora_dict = {
+						"Lora_peft_layer_name_pre": config["Lora_peft_layer_name"][0],
+						"Lora_peft_layer_name_suffix": config["Lora_peft_layer_name"][1],
+						"LP_layer_no_start": config["Lora_peft_layer_no"][0],
+						"LP_layer_no_end": config["Lora_peft_layer_no"][1]
+					}
+					model = PrithviSegLora(config["pretrained_cfg"], lora_dict, None, True, n_classes=4, model_size=args.model_size, r=r_param, alpha=alpha_param)
 
 				elif "spatial" in group:
 					model = TinyPrithviSeg(
@@ -122,19 +131,17 @@ def main():
 						dropout=0.1,
 					)
 
-				elif "qtransformer" in group:
-					model = TemporalQFormer(
+				elif "lsp" in group and "patch" in group:
+					patch_size = int(group.split("_")[3].replace("patch", ""))
+					model = TemporalTransformerPerPatch(
 						input_channels=6,
-						ctx_channels=1024,
 						seq_len=12,
 						num_classes=4,
 						d_model=128,
 						nhead=4,
-						num_layers=3,   # self-attn layers on pixel tokens
+						num_layers=3,
 						dropout=0.1,
-						fusion="qformer",   # try 'concat' for a very simple baseline
-						num_xattn=2,        # number of cross-attn blocks
-						mlp_ratio=4.0
+						patch_size=(patch_size, patch_size),
 					)
 
 				elif "lsp" in group:
@@ -148,23 +155,13 @@ def main():
 						dropout=0.1
 					)
 
-				elif "sigmoidtemp" in group:
-					from prithvi_hf.prithvi_temp import PrithviSeg
-					model = PrithviSeg(config["pretrained_cfg"], weights_path, True, n_classes=4, model_size=args.model_size)
-
 				else: 
 					model=PrithviSeg(config["pretrained_cfg"], weights_path, True, n_classes=4, model_size=args.model_size)
 
 				model=model.to(device)
 				model.load_state_dict(torch.load(checkpoint)["model_state_dict"])
 
-				pca_feats_path = config["data_dir"] + f"/HLS_composites_HP-LSP_PCA_Feats/"
-				val_feats_path = pca_feats_path + "val/"
-
-				if "qtransformer" in group:
-					acc_dataset_val, _, _ = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"), val_feats_path)
-				else: 
-					acc_dataset_val, _,  _ = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"))
+				acc_dataset_val, _,  _ = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"))
 
 				print(f"Region: {region}")
 				print(f"Parameters: {params}")

@@ -9,11 +9,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from prithvi_hf.lsp_unet import UNet3DTimeAware
+from prithvi_hf.prithvi_lora import PrithviSegLora
 
 from utils import segmentation_loss, eval_data_loader, get_masks_paper, save_checkpoint,str2bool
 from utils import data_path_paper_all_12month_match
-from utils import print_trainable_parameters
 
 from dataloader_fullsize_all import cycle_dataset
 
@@ -24,7 +23,6 @@ def main():
 	# Parse the arguments
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the model")
-	parser.add_argument("--freeze", type=str2bool, default=False, help="Whether to unfreeze the model or not")
 	parser.add_argument("--logging", type=str2bool, default=False, help="Whether to log the results or not")
 	parser.add_argument("--model_size", type=str, default="300m", help="Size of the model to use")
 	parser.add_argument("--load_checkpoint", type=str2bool, default=False, help="Whether to load a checkpoint or not")
@@ -32,7 +30,12 @@ def main():
 	parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
 	parser.add_argument("--data_percentage", type=float, default=1.0, help="Data percentage to use")
 	parser.add_argument("--using_sampler", type=str2bool, default=False, help="Whether to use sampler or not")
-	parser.add_argument("--region_to_cut", type=str, default="EASTERN_TEMPERATE_FORESTS", help="Region to cut")
+	parser.add_argument("--region_to_cut", type=str, default="All", help="Region to cut")
+	parser.add_argument("--temporal_only", type=str2bool, default=False, help="Whether to use temporal only attention or not")
+
+	#lora parameters r and alpha 
+	parser.add_argument("--r", type=int, default=8, help="Rank of the LoRA matrix")
+	parser.add_argument("--alpha", type=int, default=16, help="Alpha of the LoRA matrix")
 
 	args = parser.parse_args()
 	args.region_to_cut_name = args.region_to_cut.lower()
@@ -40,14 +43,15 @@ def main():
 
 	wandb_config = {
 		"learningrate": args.learning_rate,
-		"freeze": args.freeze,
 		"model_size": args.model_size,
 		"load_checkpoint": args.load_checkpoint, 
 		"batch_size": args.batch_size,
 		"data_percentage": args.data_percentage,
+		"r": args.r,
+		"alpha": args.alpha,
 	}
 
-	wandb_name = str(wandb_config["learningrate"]) + "_batch_size-" + str(args.batch_size)
+	wandb_name = str(wandb_config["learningrate"]) + "_batch_size-" + str(args.batch_size) + "_r-" + str(args.r) + "_alpha-" + str(args.alpha)
 
 	with open(f'configs/config_{args.model_size}.yaml', 'r') as f:
 		config = yaml.safe_load(f)
@@ -86,31 +90,31 @@ def main():
 		replacement=True
 	)
 
-
 	if args.using_sampler:
-		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],num_workers=1, sampler=sampler)
+		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],num_workers=2, sampler=sampler)
 	else:
 		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],shuffle=config["training"]["shuffle"],num_workers=2)
 
 	val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=1)
 	test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=1)
 
-
-
 	device = "cuda"
-	model = UNet3DTimeAware(
-		in_ch=6,
-		num_classes=4,
-		base_ch=32,   # try 32 or 48; 32 is pretty lightweight
-		depth=4,      # spatial pyramid /16; needs H,W divisible by 16
-		k_t=3,
-		norm='bn',
-		dropout=0.0,
-		time_pool='mean',  # 'conv' if you want a tiny learned temporal collapse
-	)
-	
+	weights_path = config["pretrained_cfg"]["prithvi_model_new_weight"] if args.load_checkpoint else None
+
+
+	lora_dict = {
+		"Lora_peft_layer_name_pre": config["Lora_peft_layer_name"][0],
+		"Lora_peft_layer_name_suffix": config["Lora_peft_layer_name"][1],
+		"LP_layer_no_start": config["Lora_peft_layer_no"][0],
+		"LP_layer_no_end": config["Lora_peft_layer_no"][1]
+	}
+	model = PrithviSegLora(config["pretrained_cfg"], lora_dict, weights_path, True, n_classes=4, model_size=args.model_size, r=args.r, alpha=args.alpha)
 	model=model.to(device)
-	print_trainable_parameters(model)
+
+	model.backbone.model.model.encoder.eval()
+	for blk in model.backbone.model.model.encoder.blocks:
+		for param in blk.parameters():
+			param.requires_grad = False
 
 	group_name_checkpoint = f"{group_name}_{args.data_percentage}"
 	checkpoint_dir = config["training"]["checkpoint_dir"] + f"/paper_fullsize_12month_match_location/{group_name_checkpoint}"
@@ -186,6 +190,17 @@ def main():
 		if acc_dataset_val_mean<best_acc_val:
 			save_checkpoint(model, optimizer, epoch, epoch_loss_train, epoch_loss_val, checkpoint)
 			best_acc_val=acc_dataset_val_mean
+
+		if epoch == 1: 
+			model.backbone.model.model.encoder.train()
+			for blk in model.backbone.model.model.encoder.blocks:
+				for param in blk.parameters():
+					param.requires_grad = True
+
+			print("UnFreezing prithvi model")
+			print("="*100)
+
+
 
 	model.load_state_dict(torch.load(checkpoint)["model_state_dict"])
 

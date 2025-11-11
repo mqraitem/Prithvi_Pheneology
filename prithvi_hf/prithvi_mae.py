@@ -734,3 +734,89 @@ class PrithviMAE(nn.Module):
         location_coords: None | torch.Tensor = None,
     ) -> List[torch.Tensor]:
         return self.encoder.forward_features(x, temporal_coords, location_coords)
+
+
+import torch
+import torch.nn as nn
+
+class TemporalOnlyAttention(nn.Module):
+    """
+    Temporal-only MHSA over patch tokens:
+      - Attends along T independently for each spatial site S.
+      - Leaves the CLS token untouched inside attention (it still flows via residual).
+    This copies weights from a timm Attention module: qkv, proj, and keeps head config.
+    """
+    def __init__(self, num_heads, embed_dim, attn_drop=0., proj_drop=0., qkv_bias=True, num_frames=1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.num_frames = num_frames  # T known from the encoder config (patch_t == 1 in your setup)
+
+        # parameters copied from the original Attention
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    @classmethod
+    def from_attention(cls, attn_module, num_frames: int):
+        """Build from an existing timm Attention, copying weights."""
+        m = cls(
+            num_heads=attn_module.num_heads,
+            embed_dim=attn_module.qkv.in_features,
+            attn_drop=attn_module.attn_drop.p if isinstance(attn_module.attn_drop, nn.Dropout) else 0.,
+            proj_drop=attn_module.proj_drop.p if isinstance(attn_module.proj_drop, nn.Dropout) else 0.,
+            qkv_bias=attn_module.qkv.bias is not None,
+            num_frames=num_frames,
+        )
+        # copy weights
+        m.qkv.load_state_dict(attn_module.qkv.state_dict(), strict=True)
+        m.proj.load_state_dict(attn_module.proj.state_dict(), strict=True)
+        return m
+
+    def forward(self, x):
+        """
+        x: (B, 1 + S*T, C) where the first token is CLS.
+        We compute MHSA only on the patch tokens along T within each spatial site.
+        """
+        B, N, C = x.shape
+        assert C == self.embed_dim, "Embed dim mismatch"
+
+        # split out CLS
+        cls_tok = x[:, :1, :]               # (B, 1, C)
+        toks    = x[:, 1:, :]               # (B, S*T, C)
+
+        # infer S from length and known T
+        T = self.num_frames
+        assert (toks.shape[1] % T) == 0, f"Sequence length {toks.shape[1]} not divisible by T={T}"
+        S = toks.shape[1] // T              # number of spatial sites
+
+        # qkv on patch tokens only
+        qkv = self.qkv(toks)                # (B, S*T, 3C)
+        qkv = qkv.reshape(B, S*T, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)    # (3, B, h, S*T, Dh)
+        q, k, v = qkv[0], qkv[1], qkv[2]    # each (B, h, S*T, Dh)
+
+        # reshape to [B, h, S, T, Dh]
+        q = q.reshape(B, self.num_heads, S, T, self.head_dim)
+        k = k.reshape(B, self.num_heads, S, T, self.head_dim)
+        v = v.reshape(B, self.num_heads, S, T, self.head_dim)
+
+        # temporal-only attention per spatial site: [B,h,S,T,T]
+        attn = torch.einsum('bhstd,bhsud->bhstu', q, k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        # aggregate over time -> [B,h,S,T,Dh], then flatten back to [B, S*T, C]
+        out = torch.einsum('bhstu,bhsud->bhstd', attn, v)
+        out = out.reshape(B, self.num_heads, S*T, self.head_dim)
+        out = out.transpose(2, 1).reshape(B, S*T, C)   # (B, S*T, C)
+
+        # project & concat CLS back
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        out = torch.cat([cls_tok, out], dim=1)         # (B, 1+S*T, C)
+
+        return out

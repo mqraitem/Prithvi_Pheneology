@@ -9,11 +9,11 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from prithvi_hf.lsp_transformer_pixels_feats import TemporalQFormer
+from prithvi_hf.lsp_transformer_patches import TemporalTransformerPerPatch
 from utils import segmentation_loss, segmentation_loss_pixels, eval_data_loader, get_masks_paper, print_trainable_parameters, save_checkpoint,str2bool
 
 from utils import data_path_paper_all_12month_match
-from dataloader_fullsize_all_pixels import cycle_dataset_pixels
+from dataloader_fullsize_all_pixels_patch import cycle_dataset_patches
 from dataloader_fullsize_all import cycle_dataset
 from utils import print_trainable_parameters
 
@@ -28,8 +28,8 @@ def main():
 	parser.add_argument("--group_name", type=str, default="default", help="Group name for wandb")
 	parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
 	parser.add_argument("--data_percentage", type=float, default=1.0, help="Data percentage to use")
-	parser.add_argument("--region_to_cut", type=str, default="EASTERN_TEMPERATE_FORESTS", help="Region to cut")
-	parser.add_argument("--concat_method", type=str, default="qformer", help="Concat method")
+	parser.add_argument("--region_to_cut", type=str, default="All", help="Region to cut")
+	parser.add_argument("--patch_size", type=int, default=16, help="Patch size")
 
 	args = parser.parse_args()
 	args.region_to_cut_name = args.region_to_cut.lower()
@@ -62,51 +62,37 @@ def main():
 				)
 		wandb.run.log_code(".")
 
-
-	pca_feats_path = config["data_dir"] + f"/HLS_composites_HP-LSP_PCA_Feats/"
-
-	train_feats_path = pca_feats_path + "train_all_data.pkl"
-	val_feats_path = pca_feats_path + "val/"
-	test_feats_path = pca_feats_path + "test/"
-
 	path_train=data_path_paper_all_12month_match("training", args.data_percentage, args.region_to_cut)
 	path_val=data_path_paper_all_12month_match("validation", args.data_percentage, args.region_to_cut)
 	path_test=data_path_paper_all_12month_match("testing", args.data_percentage, args.region_to_cut)
 
-	cache_path_train=f"{config['data_dir']}/HLS_composites_HP-LSP_Pixels/cycle_dataset_pixels_train_{args.data_percentage}_{args.region_to_cut_name}.npz"
+	cache_path_train=f"{config['data_dir']}/HLS_composites_HP-LSP_Pixels/cycle_dataset_pixels_train_{args.data_percentage}_{args.region_to_cut_name}_{args.patch_size}.npz"
 
-	cycle_dataset_train=cycle_dataset_pixels(path_train,split="training",cache_path=cache_path_train, data_percentage=args.data_percentage, region_to_cut_name=args.region_to_cut, feats_path=train_feats_path)
+	cycle_dataset_train=cycle_dataset_patches(path_train,split="training",cache_path=cache_path_train, data_percentage=args.data_percentage, region_to_cut_name=args.region_to_cut, patch_size=(args.patch_size, args.patch_size))
 	cycle_dataset_val=cycle_dataset(path_val,split="validation", data_percentage=args.data_percentage, region_to_cut_name=args.region_to_cut)
 	cycle_dataset_test=cycle_dataset(path_test,split="testing", data_percentage=args.data_percentage, region_to_cut_name=args.region_to_cut)
 
 
 	config["training"]["batch_size"] = args.batch_size
-	config["validation"]["batch_size"] = 1
-	config["test"]["batch_size"] = 1
+	config["validation"]["batch_size"] = 4
+	config["test"]["batch_size"] = 4
 
 	train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],shuffle=config["training"]["shuffle"],num_workers=2)
-	val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
-	test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
+	val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=1)
+	test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=1)
 
 	device = "cuda"
 
-	# Suppose your cached per-timestep PCA has k=32
-	K = 1024
-
-	model = TemporalQFormer(
+	model = TemporalTransformerPerPatch(
 		input_channels=6,
-		ctx_channels=K,
 		seq_len=12,
 		num_classes=4,
 		d_model=128,
 		nhead=4,
-		num_layers=3,   # self-attn layers on pixel tokens
+		num_layers=3,
 		dropout=0.1,
-		fusion=args.concat_method,   # try 'concat' for a very simple baseline
-		num_xattn=2,        # number of cross-attn blocks
-		mlp_ratio=4.0
+		patch_size=(args.patch_size, args.patch_size),
 	)
-
 	print_trainable_parameters(model)
 	model=model.to(device)
 
@@ -117,7 +103,6 @@ def main():
 	
 	optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
 	scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=5, verbose=True)
-
 
 	best_acc_val=100
 	for epoch in range(config["training"]["n_iteration"]):
@@ -131,14 +116,12 @@ def main():
 
 			input = batch_data["image"]
 			mask = batch_data["gt_mask"]	
-			feats = batch_data["feats"]
 
 			input=input.to(device)
 			mask=mask.to(device)
-			feats=feats.to(device).float()
 
 			optimizer.zero_grad()
-			out=model(input, processing_images=False, z_ctx=feats)
+			out=model(input, processing_images=False)
 
 			loss=segmentation_loss_pixels(mask,out,device=device)
 			loss_i += loss.item() * input.size(0)  # Multiply by batch size
@@ -154,8 +137,8 @@ def main():
 		epoch_loss_train = loss_i / len(train_dataloader.dataset)
 
 		# Validation Phase
-		acc_dataset_val, _, epoch_loss_val = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"), val_feats_path)
-		acc_dataset_test, _, epoch_loss_test = eval_data_loader(test_dataloader, model, device, get_masks_paper("test"), test_feats_path)
+		acc_dataset_val, _, epoch_loss_val = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"))
+		acc_dataset_test, _, epoch_loss_test = eval_data_loader(test_dataloader, model, device, get_masks_paper("test"))
 		
 		if args.logging: 
 			to_log = {} 
@@ -187,8 +170,8 @@ def main():
 
 	model.load_state_dict(torch.load(checkpoint)["model_state_dict"])
 
-	acc_dataset_val, _, epoch_loss_val = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"), val_feats_path)
-	acc_dataset_test, _, _ = eval_data_loader(test_dataloader, model, device, get_masks_paper("test"), test_feats_path)
+	acc_dataset_val, _, epoch_loss_val = eval_data_loader(val_dataloader, model, device, get_masks_paper("train"))
+	acc_dataset_test, _, _ = eval_data_loader(test_dataloader, model, device, get_masks_paper("test"))
 
 	if args.logging:
 		for idx in range(4): 

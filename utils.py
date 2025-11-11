@@ -1,6 +1,7 @@
 import os
 import pickle
 import argparse
+from typing import Any
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -77,7 +78,8 @@ def segmentation_loss(mask, pred, device, ignore_index=-1):
 
 def get_masks_paper(data="train", device="cuda"):
 
-	test_file = f"/usr4/cs505/mqraitem/ivc-ml/geo/data/LSP_{data}_samples.csv"
+	data_name = "train" if data in ["train", "val"] else "test"
+	test_file = f"/usr4/cs505/mqraitem/ivc-ml/geo/data/LSP_{data_name}_samples.csv"
 	
 	data_paper_df = pd.read_csv(test_file)
 	data_paper_df = data_paper_df[data_paper_df["version"] == "v1"]
@@ -120,7 +122,7 @@ def compute_accuracy(gt_hls_tile, pred_hls_tile_avg, all_errors_hls_tile, hls_ti
 	return all_errors_hls_tile
 
 
-def eval_data_loader(data_loader,model, device, tiles_paper_masks, feats_path=None):
+def eval_data_loader(data_loader,model, device, tiles_paper_masks, feats_path=None, temp_feats_path=None):
 
 	model.eval()
 
@@ -144,6 +146,10 @@ def eval_data_loader(data_loader,model, device, tiles_paper_masks, feats_path=No
 				assert feats.shape[0] == input.shape[0], f"Feats shape {feats.shape} does not match input shape {input.shape}"
 				predictions=model(input, z_ctx=feats)
 			
+			elif temp_feats_path is not None:
+				temp_feats = data["temp_feats"].to(device).float()[:, 0]
+				predictions=model(input, temp_feats)
+
 			else:
 				predictions=model(input)
 

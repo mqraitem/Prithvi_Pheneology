@@ -9,7 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
  
-from prithvi_hf.lsp_conv import GlobalTemporalConvNet
+from prithvi_hf.lsp_conv_pixels import GlobalTemporalConvNetFlexible
 
 from utils import segmentation_loss, eval_data_loader, get_masks_paper, save_checkpoint,str2bool
 from utils import data_path_paper_all_12month_match

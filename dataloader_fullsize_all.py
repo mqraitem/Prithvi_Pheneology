@@ -130,7 +130,7 @@ def preprocess_image(image, mask, means, stds):
 	return normalized_tensor
 
 class cycle_dataset(Dataset):
-	def __init__(self,path,split, data_percentage=1.0, region_to_cut_name="EASTERN TEMPERATE FORESTS", means=None, stds=None):
+	def __init__(self,path,split, data_percentage=1.0, region_to_cut_name="EASTERN TEMPERATE FORESTS", means=None, stds=None, temp_feats_path=None):
 		
 		self.data_dir=path
 		self.split=split
@@ -156,6 +156,7 @@ class cycle_dataset(Dataset):
 			print("Using precomputed means and stds")
 
 		self.assign_region_weights()
+		self.temp_feats_path = temp_feats_path
 
 
 	def get_means_stds(self):
@@ -354,6 +355,11 @@ class cycle_dataset(Dataset):
 			"gt_mask": gt_mask,
 			"hls_tile_name": hls_tile_name,
 		}
+
+
+		if self.temp_feats_path is not None:
+			temp_feats = np.load(self.temp_feats_path + f"{hls_tile_name}.npy")
+			to_return["temp_feats"] = temp_feats
 	
 		return to_return
 	

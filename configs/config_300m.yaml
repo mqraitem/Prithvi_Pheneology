@@ -40,7 +40,7 @@
       "shuffle": false,
       "batch_size":2, 
   },
-  "Lora_peft_layer_name": ["blocks","mlp.fc"],
+  "Lora_peft_layer_name": ["blocks","attn"],
   "Lora_peft_layer_no": [0,23]
 }
 

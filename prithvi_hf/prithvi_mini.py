@@ -45,29 +45,55 @@ class TinyPrithviEncoder(nn.Module):
         self.T = T
         self.d_model = d_model
         self.pos_cache = None
+        self.mask_cache = None  # <-- add
 
-    def forward(self, x):
-        # x: (B,C,T,H,W) with H=W=self.img_size
+    def _temporal_only_mask(self, Tp, Hp, Wp, device, dtype=torch.float32):
+        L = Tp*Hp*Wp
+        # If cached, reuse
+        if (self.mask_cache is not None and
+            self.mask_cache.shape == (L, L) and
+            self.mask_cache.device == device and
+            self.mask_cache.dtype == dtype):
+            return self.mask_cache
+
+        # Build additive mask: 0 where allowed, -inf where blocked
+        mask = torch.full((L, L), float('-inf'), device=device, dtype=dtype)
+        hw = Hp * Wp
+        # For each spatial location, allow all t<->t' attentions within that location
+        # (loop over spatial positions once; this happens only when grid changes)
+        for s in range(hw):
+            idxs = s + torch.arange(Tp, device=device) * hw   # positions for this (h,w) across time
+            mask[idxs[:, None], idxs[None, :]] = 0.0
+
+        self.mask_cache = mask
+        return mask
+
+    def forward(self, x, use_temporal_only_attn=False):
+        # x: (B,C,T,H,W)
         B,C,T,H,W = x.shape
-        assert T % self.patch[0] == 0 and H % self.patch[1] == 0 and W % self.patch[2] == 0
-        tok, (Tp,Hp,Wp) = self.embed(x)                 # (B,L,E)
+        tok, (Tp,Hp,Wp) = self.embed(x)   # (B, L, E), L=Tp*Hp*Wp
 
-        # fixed 3D pos enc
+        # Positional encoding (unchanged)
         L = Tp*Hp*Wp
         if (self.pos_cache is None) or (self.pos_cache.shape[0] != L or self.pos_cache.shape[1] != self.d_model):
             self.pos_cache = get_3d_sincos_pos_embed(self.d_model, Tp, Hp, Wp).to(tok.device)  # (L,E)
-        tok = tok + self.pos_cache.unsqueeze(0)          # (B,L,E)
+        tok = tok + self.pos_cache.unsqueeze(0)
 
-        tok = self.encoder(tok)                          # (B,L,E)
+        mask = None
+        if use_temporal_only_attn:
+            mask = self._temporal_only_mask(Tp, Hp, Wp, tok.device, tok.dtype)  # (L, L)
+
+        tok = self.encoder(tok, mask=mask)   # <- key change
         tok = self.dropout(tok)
         return tok, (Tp,Hp,Wp)
+
 
 class TinyPrithviSeg(nn.Module):
     """
     Patchify + full spatiotemporal attention; tiny; trained from scratch.
     """
     def __init__(self, in_ch=6, T=4, img_size=256, patch=(1,4,4),
-                 d_model=128, depth=3, nhead=4, num_classes=4, up_depth=3):
+                 d_model=128, depth=3, nhead=4, num_classes=4, up_depth=3, use_temporal_only_attn=False):
         super().__init__()
         self.enc = TinyPrithviEncoder(in_ch, T, img_size, patch, d_model, depth, nhead)
         self.patch = patch
@@ -90,17 +116,17 @@ class TinyPrithviSeg(nn.Module):
             c = c//2
         self.up = nn.Sequential(*blocks)
         self.head = nn.Conv2d(c, num_classes, kernel_size=1)
+        self.use_temporal_only_attn = use_temporal_only_attn
 
     def forward(self, x):
         # x: (B,C,T,H,W)
         B,C,T,H,W = x.shape
-        tok, (Tp,Hp,Wp) = self.enc(x)               # (B,L,E)
-        E = tok.shape[-1]
-        # reshape tokens to feature map: (B, T', H', W', E) -> (B, E*T', H', W')
+        tok, (Tp,Hp,Wp) = self.enc(x, use_temporal_only_attn=self.use_temporal_only_attn)
+        B = x.shape[0]; E = tok.shape[-1]
         feat = tok[:, :Tp*Hp*Wp, :].reshape(B, Tp, Hp, Wp, E)
-        feat = rearrange(feat, "b t h w e -> b (t e) h w")  # (B, E*Tp, Hp, Wp)
-
+        feat = rearrange(feat, "b t h w e -> b (t e) h w")
         feat = self.proj(feat)
-        out = self.up(feat)                          # (B, ?, H, W)
-        logits = self.head(out)                      # (B, num_classes, H, W)
+        out  = self.up(feat)
+        logits = self.head(out)
         return logits
+

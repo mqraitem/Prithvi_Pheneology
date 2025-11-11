@@ -9,10 +9,11 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from prithvi_hf.prithvi import PrithviSeg
+from prithvi_hf.prithvi_mini import TinyPrithviSeg
 
 from utils import segmentation_loss, eval_data_loader, get_masks_paper, save_checkpoint,str2bool
 from utils import data_path_paper_all_12month_match
+from utils import print_trainable_parameters
 
 from dataloader_fullsize_all import cycle_dataset
 
@@ -32,6 +33,8 @@ def main():
 	parser.add_argument("--data_percentage", type=float, default=1.0, help="Data percentage to use")
 	parser.add_argument("--using_sampler", type=str2bool, default=False, help="Whether to use sampler or not")
 	parser.add_argument("--region_to_cut", type=str, default="EASTERN_TEMPERATE_FORESTS", help="Region to cut")
+	parser.add_argument("--patch_size", type=int, default=16, help="Patch size")
+	parser.add_argument("--use_temporal_only_attn", type=str2bool, default=False, help="Whether to use temporal only attention or not")
 
 	args = parser.parse_args()
 	args.region_to_cut_name = args.region_to_cut.lower()
@@ -85,6 +88,7 @@ def main():
 		replacement=True
 	)
 
+
 	if args.using_sampler:
 		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],num_workers=2, sampler=sampler)
 	else:
@@ -93,17 +97,24 @@ def main():
 	val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
 	test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
 
+
+
 	device = "cuda"
-	weights_path = config["pretrained_cfg"]["prithvi_model_new_weight"] if args.load_checkpoint else None
-	model=PrithviSeg(config["pretrained_cfg"], weights_path, True, n_classes=4, model_size=args.model_size) #wrapper of prithvi #initialization of prithvi is done by initializing prithvi_loader.py
+	model = TinyPrithviSeg(
+		in_ch=6,
+		T=12,                 # match baseline seq_len
+		img_size=336,
+		patch=(1,args.patch_size,args.patch_size),      # keeps tokens small; 12×21×21 tokens
+		d_model=132,           # modest width
+		depth=3,              # 3 encoder layers
+		nhead=4,              # 80 / 4 = 20 per head
+		num_classes=4,
+		up_depth=4,           # /16 -> /8 -> /4 -> /2 -> /1
+		use_temporal_only_attn=args.use_temporal_only_attn,
+	)
 
 	model=model.to(device)
-
-	model.backbone.model.encoder.eval()
-	for blk in model.backbone.model.encoder.blocks:
-		for param in blk.parameters():
-			param.requires_grad = False
-
+	print_trainable_parameters(model)
 
 	group_name_checkpoint = f"{group_name}_{args.data_percentage}"
 	checkpoint_dir = config["training"]["checkpoint_dir"] + f"/paper_fullsize_12month_match_location/{group_name_checkpoint}"
@@ -179,15 +190,6 @@ def main():
 		if acc_dataset_val_mean<best_acc_val:
 			save_checkpoint(model, optimizer, epoch, epoch_loss_train, epoch_loss_val, checkpoint)
 			best_acc_val=acc_dataset_val_mean
-
-		if epoch == 1 and (not args.freeze): 
-			model.backbone.model.encoder.train()
-			for blk in model.backbone.model.encoder.blocks:
-				for param in blk.parameters():
-					param.requires_grad = True
-
-			print("UnFreezing prithvi model")
-			print("="*100)
 
 	model.load_state_dict(torch.load(checkpoint)["model_state_dict"])
 

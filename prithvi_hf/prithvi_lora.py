@@ -1,7 +1,30 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+import peft
+
+def LORA_peft(model,Lora_peft_layer_name_pre,Lora_peft_layer_name_suffix,LP_layer_no_start,LP_layer_no_end,r,alpha):
+
+    target_modules: list[str] = [f"{Lora_peft_layer_name_pre}.{i}.{Lora_peft_layer_name_suffix}.qkv" 
+                                 for i in range(LP_layer_no_start,LP_layer_no_end+1)
+                                ] + [
+                                f"{Lora_peft_layer_name_pre}.{i}.{Lora_peft_layer_name_suffix}.proj" 
+                                for i in range(LP_layer_no_start,LP_layer_no_end+1)
+                                ]
+
     
+    peft_config = peft.LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=0.1,
+        bias="none",
+        target_modules=target_modules,
+        # modules_to_save=["model.head"],
+        )
+    
+    lora_model = peft.get_peft_model(model=model, peft_config=peft_config)
+    return lora_model
+
 
 class PrithviReshape(nn.Module):
     def __init__(self,
@@ -33,11 +56,11 @@ class PrithviBackbone(nn.Module):
         self.prithvi_ckpt_path = prithvi_ckpt_path
         self.prithvi_params = prithvi_params
 
-        from prithvi_hf.prithvi_mae_temp import PrithviMAE
+        from prithvi_hf.prithvi_mae import PrithviMAE
         self.model = PrithviMAE(**self.prithvi_params)
         if self.prithvi_ckpt_path is not None:
-
             checkpoint = torch.load(self.prithvi_ckpt_path, weights_only=False)
+
 
             if "encoder.pos_embed" not in checkpoint.keys():
                 key = "model" if "model" in checkpoint.keys() else "state_dict"
@@ -111,22 +134,34 @@ class Upscaler(nn.Module):
         return self.upscale_blocks(x)
 
 
-class PrithviSeg(nn.Module): 
+
+class PrithviSegLora(nn.Module): 
     def __init__(self,
                  prithvi_params: dict,
+                 lora_dict: dict,
                  prithvi_ckpt_path: str = None,
                  reshape: bool = True, 
                  n_classes: int = 1,
-                 model_size: str="300m"):
+                 model_size: str="300m",
+                 r: int = 8,
+                 alpha: int = 16):
         super().__init__()
 
         self.backbone = PrithviBackbone(prithvi_params, prithvi_ckpt_path, reshape)
+        self.backbone=LORA_peft(self.backbone,lora_dict["Lora_peft_layer_name_pre"],lora_dict["Lora_peft_layer_name_suffix"],lora_dict["LP_layer_no_start"],lora_dict["LP_layer_no_end"], r, alpha)
 
         if model_size == "300m":
             print("Dim: ", prithvi_params["embed_dim"]*prithvi_params["num_frames"])
             self.head = nn.Sequential(
                 Upscaler(prithvi_params["embed_dim"]*prithvi_params["num_frames"] , 4),
                 nn.Conv2d(in_channels=768, out_channels=n_classes, kernel_size=1),
+            )
+
+        elif model_size == "600m":
+            self.head = nn.Sequential(
+                Upscaler(prithvi_params["embed_dim"]*prithvi_params["num_frames"] , 4),
+                nn.Conv2d(in_channels=320, out_channels=n_classes * prithvi_params["num_frames"], kernel_size=1),
+                nn.AdaptiveAvgPool2d((224, 224))
             )
 
         else: 
@@ -141,9 +176,5 @@ class PrithviSeg(nn.Module):
         x = self.head(x)
         x = x.view(batch_size, self.n_classes, x.size(2), x.size(3))   
         x = torch.sigmoid(x)
-        return x
 
-    def forward_features(self, x):
-        batch_size = x.size(0)
-        x = self.backbone(x)
         return x

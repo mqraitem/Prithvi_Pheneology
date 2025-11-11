@@ -12,4 +12,4 @@ export PATH=/projectnb/ivc-ml/mqraitem/miniconda3/bin:$PATH
 source activate geo
 
 # Run your commands
-python train_fullsize_all_bot.py $args
+python train_fullsize_all_prithvi_lora.py $args

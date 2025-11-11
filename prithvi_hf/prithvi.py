@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from prithvi_hf.prithvi_mae import TemporalOnlyAttention
     
 
 class PrithviReshape(nn.Module):
@@ -23,12 +24,28 @@ class PrithviReshape(nn.Module):
 
         return latent
 
+from timm.models.vision_transformer import Block
+
+def make_temporal_only_attention(prithvi_vit_module, num_frames: int):
+    """
+    Replace each Block.attn with TemporalOnlyAttention (weight-preserving).
+    Call this ONCE after loading the pretrained checkpoint.
+
+    prithvi_vit_module: instance of your PrithviViT
+    num_frames: T used by the encoder (prithvi_vit_module.num_frames)
+    """
+    for i, blk in enumerate(prithvi_vit_module.blocks):
+        old = blk.attn
+        new = TemporalOnlyAttention.from_attention(old, num_frames=num_frames)
+        blk.attn = new
+
 
 class PrithviBackbone(nn.Module):
     def __init__(self,
                  prithvi_params: dict,
                  prithvi_ckpt_path: str = None,
-                 reshape: bool = True):
+                 reshape: bool = True,
+                 temporal_only: bool = False):
         super().__init__()
         self.prithvi_ckpt_path = prithvi_ckpt_path
         self.prithvi_params = prithvi_params
@@ -60,6 +77,9 @@ class PrithviBackbone(nn.Module):
             _ = self.model.load_state_dict(checkpoint, strict=False)
             
         self.reshaper = PrithviReshape(prithvi_params["patch_size"], prithvi_params["img_size"]) if reshape else nn.Identity()
+        if temporal_only:
+            make_temporal_only_attention(self.model.encoder, num_frames=self.model.encoder.num_frames)
+
 
 
     def forward(self, data):
@@ -117,10 +137,11 @@ class PrithviSeg(nn.Module):
                  prithvi_ckpt_path: str = None,
                  reshape: bool = True, 
                  n_classes: int = 1,
-                 model_size: str="300m"):
+                 model_size: str="300m",
+                 temporal_only: bool = False):
         super().__init__()
 
-        self.backbone = PrithviBackbone(prithvi_params, prithvi_ckpt_path, reshape)
+        self.backbone = PrithviBackbone(prithvi_params, prithvi_ckpt_path, reshape, temporal_only)
 
         if model_size == "300m":
             print("Dim: ", prithvi_params["embed_dim"]*prithvi_params["num_frames"])
@@ -147,3 +168,4 @@ class PrithviSeg(nn.Module):
         batch_size = x.size(0)
         x = self.backbone(x)
         return x
+ 

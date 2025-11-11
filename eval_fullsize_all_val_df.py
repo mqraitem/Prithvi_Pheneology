@@ -23,6 +23,8 @@ from utils import data_path_paper_all_12month_match
 from dataloader_fullsize_all import cycle_dataset
 
 
+ALL_DAYS = list(range(1, 31))
+
 #######################################################################################
 
 def main():
@@ -52,12 +54,18 @@ def main():
 		"Date": [], 
 	}
 
+	cis_names = [str(x) + " Days" for x in ALL_DAYS]
+	for ci_name in cis_names:
+		results_ci[f"CI {ci_name}"] = []
+
 	region = "paper_fullsize_12month_match_location"
 	best_param_df = pd.read_csv(f"results/best_param_{args.model_size}_{region}.csv")
 	model_names = best_param_df["Group"].values
 
 	for model_name in model_names:
 
+		if model_name not in ["freeze-False_loadcheckpoint-True_fullsize_sigmoid_region-all_1.0", "transformer_lsp_fullsize_pixels_all_1.0", "loadcheckpoint-True_fullsize_sigmoid_lora_region-all_1.0", "freeze-False_loadcheckpoint-True_fullsize_sigmoid_sampler_region-all_1.0"]:
+			continue
 
 		data_percentage = model_name.split("_")[-1] 
 		if "pixels" in model_name or "patch" in model_name:
@@ -65,19 +73,32 @@ def main():
 		else: 
 			region_to_cut = " ".join(model_name.split("region-")[1].split("_")[:-1]).upper()
 
-		path_test=data_path_paper_all_12month_match("testing", data_percentage, region_to_cut) 
-		cycle_dataset_test=cycle_dataset(path_test,split="test", data_percentage=data_percentage, region_to_cut_name=region_to_cut)
+		print(data_percentage, region_to_cut)
 
-		# path_test=data_path_paper_all_12month_match("testing") 
-		# cycle_dataset_test=cycle_dataset(path_test,split="test")
+		split = "train"
+		if split == "train":
+			path_test=data_path_paper_all_12month_match("training", data_percentage, region_to_cut) 
+			cycle_dataset_test=cycle_dataset(path_test,split="training", data_percentage=data_percentage, region_to_cut_name=region_to_cut)
+			
+			train_dataloader=DataLoader(cycle_dataset_test,batch_size=1,shuffle=config["training"]["shuffle"],num_workers=2)
+
+			data_loader = train_dataloader
+			data_loader_name = "train"
+
+		elif split == "val":
+			path_test=data_path_paper_all_12month_match("validation", data_percentage, region_to_cut) 
+			cycle_dataset_test=cycle_dataset(path_test,split="validation", data_percentage=data_percentage, region_to_cut_name=region_to_cut)
+			
+			val_dataloader=DataLoader(cycle_dataset_test,batch_size=1,shuffle=config["validation"]["shuffle"],num_workers=2)
+
+			data_loader = val_dataloader
+			data_loader_name = "val"
 		
-		test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
+		else: 
+			raise ValueError(f"Invalid split: {split}")
 
 
-		data_loader = test_dataloader
-		data_loader_name = "test"
-
-		if os.path.exists(f"results/{model_name}_{data_loader_name}.csv"):
+		if os.path.exists(f"results_{split}/{model_name}_{data_loader_name}.csv"):
 			print(f"Results for {model_name} on {data_loader_name} already exist, skipping...")
 			continue
 
@@ -85,6 +106,7 @@ def main():
 		best_param = best_param_df[best_param_df["Group"] == model_name]["Best Param"].values[0] 
 
 		print(f"Best parameters: {best_param}")
+
 
 		if "unet" in model_name:
 			model = UNet3D(
@@ -159,15 +181,9 @@ def main():
 
 		model=model.to(device)
 		model.load_state_dict(torch.load(os.path.join(config_dir, best_param))["model_state_dict"])
-
-		if "qtransformer" in model_name:
-			pca_feats_path = config["data_dir"] + f"/HLS_composites_HP-LSP_PCA_Feats/"
-			test_feats_path = pca_feats_path + "test/"
-			out_df = eval_data_loader_df(data_loader, model, device, get_masks_paper(data_loader_name), test_feats_path)
-		else: 
-			out_df = eval_data_loader_df(data_loader, model, device, get_masks_paper(data_loader_name))
+		out_df = eval_data_loader_df(data_loader, model, device, get_masks_paper(split))
 		
-		out_df.to_csv(f"results/{model_name}_{data_loader_name}.csv", index=False)
+		out_df.to_csv(f"results_{split}/{model_name}_{data_loader_name}.csv", index=False)
 
 
 if __name__ == "__main__":

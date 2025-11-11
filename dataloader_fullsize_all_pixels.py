@@ -4,6 +4,8 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import pickle
+import h5py
+from tqdm import tqdm
 
 # ===== helper functions =====
 
@@ -54,7 +56,7 @@ def load_raster_output(path):
 # ===== Dataset =====
 
 class cycle_dataset_pixels(Dataset):
-	def __init__(self, data_dir, split, cache_path, data_percentage=1.0, target_size=330, regenerate=False, region_to_cut_name="EASTERN TEMPERATE FORESTS", feats_path=None):
+	def __init__(self, data_dir, split, cache_path, data_percentage=1.0, target_size=330, regenerate=False, region_to_cut_name="EASTERN TEMPERATE FORESTS", h5_path=None):
 		"""
 		Args:
 			data_dir: list of tuples [(image_paths, gt_path, hls_tile_name), ...]
@@ -72,9 +74,7 @@ class cycle_dataset_pixels(Dataset):
 		self.region_to_cut_name = region_to_cut_name
 		self.region_to_cut_name = region_to_cut_name.replace(" ", "_").lower()
 
-		self.feats_path = feats_path
-		if self.feats_path is not None:
-			self.feats_data = pickle.load(open(feats_path, "rb"))
+		self.h5_path = h5_path
 
 		# correct gt indices
 		self.correct_indices = [2, 5, 8, 11]
@@ -93,6 +93,22 @@ class cycle_dataset_pixels(Dataset):
 			print(f"[PixelDataset] Preprocessing {split} split into pixels...")
 			self._build_dataset()
 			print(f"[PixelDataset] Saved to {self.cache_path}")
+
+
+		self._h5 = None      # opened per worker
+		self._tile_info = {} # tile -> (H0, W0, offset, N)
+
+	def _ensure_open(self):
+		if self._h5 is None:
+			self._h5 = h5py.File(self.h5_path, "r")
+			# load the index once (small)
+			idx = self._h5["index"][:]  # structured array
+			# build quick dict: tile -> (H0, W0, offset, N)
+			for rec in idx:
+				tile = rec["tile"].decode("utf8")
+				self._tile_info[tile] = (int(rec["H0"]), int(rec["W0"]), int(rec["offset"]), int(rec["N"]))
+
+
 
 	def get_means_stds(self):
 		"""
@@ -258,18 +274,141 @@ class cycle_dataset_pixels(Dataset):
 		return len(self.inputs)
 
 	def __getitem__(self, idx):
-		x = torch.from_numpy(self.inputs[idx])   # (T, C)
-		y = torch.from_numpy(self.targets[idx])  # (4,)
-		meta = self.meta[idx]
+		x = torch.from_numpy(self.inputs[idx])   # e.g., (T, C)
+		y = torch.from_numpy(self.targets[idx])  # e.g., (4,)
+		_, h, w, tile = self.meta[idx]
+		h, w, tile = int(h), int(w), str(tile)
 
-		to_return = {
-			"image": x,
-			"gt_mask": y
-		}
+		sample = {"image": x, "gt_mask": y}
 
-		if self.feats_path is not None:
-			feats = self.feats_data[meta[3]]
-			feats = torch.from_numpy(feats)
-			to_return["feats"] = feats
 
-		return to_return
+		if self.h5_path is not None:
+			print("Loading feats from h5 file")
+			self._ensure_open()
+			H0, W0, offset, N = self._tile_info.get(tile, (0, 0, 0, 0))
+			if N == 0 or not (0 <= h < H0 and 0 <= w < W0):
+				# fallback if missing
+				T = int(self._h5.attrs["T"]); E = int(self._h5.attrs["E"])
+				sample["feats"] = torch.zeros(T, E, dtype=torch.float32)
+				return sample
+
+			row = offset + h * W0 + w
+			feats_np = self._h5["inputs"][row, :, :]   # (T, E) — reads one chunk
+			sample["feats"] = torch.from_numpy(np.asarray(feats_np)).float()
+		
+		return sample
+
+
+# per_tile_fraction_sampler.py
+import math
+from typing import Iterator, List, Dict, Sequence, Optional
+import numpy as np
+import torch
+from torch.utils.data import Sampler
+
+class PerTileFractionSampler(Sampler[int]):
+    """
+    Each epoch: sample a fraction of indices from every tile.
+
+    - fraction: 0.0–1.0 (e.g., 0.1 = 10% of pixels per tile per epoch)
+    - cap_per_tile: optional hard cap per tile (e.g., 4096)
+    - min_per_tile: ensure at least this many per tile (default 1)
+    - replacement: sample with/without replacement
+    - distributed: if True, evenly split sampled indices across replicas
+    """
+    def __init__(
+        self,
+        dataset,
+        fraction: float = 0.1,
+        cap_per_tile: Optional[int] = None,
+        min_per_tile: int = 1,
+        replacement: bool = False,
+        shuffle_tiles: bool = True,
+        seed: int = 0,
+        distributed: bool = False,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+    ):
+        super().__init__(dataset)
+        assert 0.0 < fraction <= 1.0
+        self.dataset = dataset
+        self.fraction = fraction
+        self.cap_per_tile = cap_per_tile
+        self.min_per_tile = min_per_tile
+        self.replacement = replacement
+        self.shuffle_tiles = shuffle_tiles
+        self.seed = seed
+
+        # DDP settings
+        if distributed:
+            if num_replicas is None:
+                num_replicas = torch.distributed.get_world_size()
+            if rank is None:
+                rank = torch.distributed.get_rank()
+        self.distributed = distributed
+        self.num_replicas = num_replicas or 1
+        self.rank = rank or 0
+
+        # Build tile -> indices map once
+        # dataset.meta rows are (img_idx, h, w, tile)
+        tile_to_idx: Dict[str, List[int]] = {}
+        for i, m in enumerate(self.dataset.meta):
+            tile = str(m[3])
+            tile_to_idx.setdefault(tile, []).append(i)
+        self.tile_to_idx = {k: np.asarray(v, dtype=np.int64) for k, v in tile_to_idx.items()}
+        self.tiles: List[str] = list(self.tile_to_idx.keys())
+
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        # Expected number varies by epoch due to ceil; return an upper bound
+        total = 0
+        for tile in self.tiles:
+            n = len(self.tile_to_idx[tile])
+            m = max(self.min_per_tile, math.ceil(self.fraction * n))
+            if self.cap_per_tile is not None:
+                m = min(m, self.cap_per_tile)
+            total += m
+        # If distributed, each replica sees ~1/num_replicas samples
+        return math.ceil(total / self.num_replicas)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        rng = np.random.default_rng(self.seed + self.epoch)
+
+        tiles = self.tiles.copy()
+        if self.shuffle_tiles:
+            rng.shuffle(tiles)
+
+        sampled: List[int] = []
+        for tile in tiles:
+            idx = self.tile_to_idx[tile]
+            n = len(idx)
+            m = max(self.min_per_tile, math.ceil(self.fraction * n))
+            if self.cap_per_tile is not None:
+                m = min(m, self.cap_per_tile)
+
+            if self.replacement:
+                sel = rng.integers(0, n, size=m, endpoint=False)
+                sampled_idx = idx[sel]
+            else:
+                if m >= n:
+                    sampled_idx = idx.copy()
+                    rng.shuffle(sampled_idx)
+                else:
+                    sampled_idx = idx[rng.choice(n, size=m, replace=False)]
+
+            sampled.extend(sampled_idx.tolist())
+
+        # shuffle all sampled indices for this epoch
+        rng.shuffle(sampled)
+
+        # DDP split
+        if self.distributed and self.num_replicas > 1:
+            # round-robin partition
+            sampled = sampled[self.rank::self.num_replicas]
+
+        return iter(sampled)
+

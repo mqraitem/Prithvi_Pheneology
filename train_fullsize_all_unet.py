@@ -9,10 +9,11 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from prithvi_hf.prithvi_temp import PrithviSeg
+from prithvi_hf.unet import UNet3D
 
 from utils import segmentation_loss, eval_data_loader, get_masks_paper, save_checkpoint,str2bool
 from utils import data_path_paper_all_12month_match
+from utils import print_trainable_parameters
 
 from dataloader_fullsize_all import cycle_dataset
 
@@ -87,28 +88,23 @@ def main():
 
 
 	if args.using_sampler:
-		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],num_workers=2, sampler=sampler)
+		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],num_workers=1, sampler=sampler)
 	else:
 		train_dataloader=DataLoader(cycle_dataset_train,batch_size=config["training"]["batch_size"],shuffle=config["training"]["shuffle"],num_workers=2)
 
-	val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
-	test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=2)
-
+	val_dataloader=DataLoader(cycle_dataset_val,batch_size=config["validation"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=1)
+	test_dataloader=DataLoader(cycle_dataset_test,batch_size=config["test"]["batch_size"],shuffle=config["validation"]["shuffle"],num_workers=1)
 
 	device = "cuda"
-	weights_path = config["pretrained_cfg"]["prithvi_model_new_weight"] if args.load_checkpoint else None
-	model=PrithviSeg(config["pretrained_cfg"], weights_path, True, n_classes=4, model_size=args.model_size) #wrapper of prithvi #initialization of prithvi is done by initializing prithvi_loader.py
-
+	model = UNet3D(
+		in_channel=6,
+		n_classes=4,
+		timesteps=12,
+		dropout=0.1
+	)
+	
 	model=model.to(device)
-
-	model.backbone.model.encoder.eval()
-	for blk in model.backbone.model.encoder.blocks:
-		for param in blk.parameters():
-			param.requires_grad = False
-
-	# for p in model.backbone.model.encoder.norm.parameters():
-	# 	p.requires_grad = False
-
+	print_trainable_parameters(model)
 
 	group_name_checkpoint = f"{group_name}_{args.data_percentage}"
 	checkpoint_dir = config["training"]["checkpoint_dir"] + f"/paper_fullsize_12month_match_location/{group_name_checkpoint}"
@@ -184,19 +180,6 @@ def main():
 		if acc_dataset_val_mean<best_acc_val:
 			save_checkpoint(model, optimizer, epoch, epoch_loss_train, epoch_loss_val, checkpoint)
 			best_acc_val=acc_dataset_val_mean
-
-		if epoch == 1 and (not args.freeze): 
-			model.backbone.model.encoder.train()
-			for blk in model.backbone.model.encoder.blocks:
-				for param in blk.parameters():
-					param.requires_grad = True
-
-			# unfreeze encoder final norm too
-			# for param in model.backbone.model.encoder.norm.parameters():
-			# 	param.requires_grad = True
-
-			print("UnFreezing prithvi model")
-			print("="*100)
 
 	model.load_state_dict(torch.load(checkpoint)["model_state_dict"])
 

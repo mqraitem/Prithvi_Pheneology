@@ -4,4 +4,6 @@ wandb/
 region_to_states.pkl
 train_tiles.txt
 results/
+results_train/
+results_val/
 records/
